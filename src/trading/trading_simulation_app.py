@@ -6,6 +6,8 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
 from neuro240_project import TradingSNN, SNNTrader, SignalTrader, RandomTrader, simulate_market
+import os
+from src.market_simulation.neuro240_project import get_visualization_path
 
 def get_stock_data(ticker, start_date, end_date):
     """Get historical stock data from Yahoo Finance"""
@@ -46,6 +48,20 @@ def run_simulation(market_data, n_snn_traders, n_signal_traders, n_random_trader
     # Run simulation
     simulated_prices = simulate_market(traders, market_data, days=days_to_simulate)
     return simulated_prices
+
+def plot_trading_analysis(trading_results):
+    # ... existing plotting code ...
+    
+    # Save the plot
+    plt.savefig(get_visualization_path('trading', 'trade_analysis.png'))
+    plt.close()
+
+def plot_real_time_predictions(predictions):
+    # ... existing plotting code ...
+    
+    # Save the plot
+    plt.savefig(get_visualization_path('trading', 'real_time_predictions.png'))
+    plt.close()
 
 def main():
     st.title("Interactive Trading Simulation")

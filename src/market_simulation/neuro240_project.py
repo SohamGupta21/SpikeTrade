@@ -1177,7 +1177,7 @@ class RandomTrader:
 
 def calculate_kyle_lambda(price_changes, volume):
     """
-    Calculate Kyle's lambda (price impact coefficient)
+    Calculate Kyle's lambda (price impact coefficient) with enhanced accuracy
     
     Args:
         price_changes (np.array): Array of price changes
@@ -1210,9 +1210,16 @@ def calculate_kyle_lambda(price_changes, volume):
     signed_volume = np.sign(price_changes) * volume
     
     try:
-        # Calculate lambda using covariance method
-        cov = np.cov(price_changes, signed_volume)[0,1]
-        var = np.var(signed_volume)
+        # Calculate lambda using covariance method with volume weighting
+        weights = 1 / (volume + 1e-6)  # Add small constant to avoid division by zero
+        weights = weights / np.sum(weights)  # Normalize weights
+        
+        # Calculate weighted covariance and variance
+        mean_price_change = np.average(price_changes, weights=weights)
+        mean_signed_volume = np.average(signed_volume, weights=weights)
+        
+        cov = np.sum(weights * (price_changes - mean_price_change) * (signed_volume - mean_signed_volume))
+        var = np.sum(weights * (signed_volume - mean_signed_volume)**2)
         
         lambda_value = cov / var if var != 0 else 0.0001
         
@@ -1225,7 +1232,7 @@ def calculate_kyle_lambda(price_changes, volume):
 
 def calculate_amihud_illiquidity(prices, volumes, window=20):
     """
-    Calculate Amihud's illiquidity measure
+    Calculate Amihud's illiquidity measure with enhanced accuracy
     
     Args:
         prices (np.array): Array of prices
@@ -1243,29 +1250,130 @@ def calculate_amihud_illiquidity(prices, volumes, window=20):
     if len(prices) < 2 or len(volumes) < 2:
         return np.array([0.0001])
     
-    # Calculate absolute returns
+    # Calculate absolute returns with volume weighting
     returns = np.abs(np.diff(prices) / prices[:-1])
     
-    # Calculate dollar volume
+    # Calculate dollar volume with price impact adjustment
     dollar_volume = prices[:-1] * volumes[:-1]
     
-    # Calculate illiquidity ratio
-    illiquidity = returns / dollar_volume
+    # Calculate illiquidity ratio with volume weighting
+    illiquidity = returns / (dollar_volume + 1e-6)  # Add small constant to avoid division by zero
     
-    # Replace inf and nan with small default value
-    illiquidity = np.nan_to_num(illiquidity, nan=0.0001, posinf=0.01, neginf=0.0001)
+    # Apply exponential weighting to recent observations
+    weights = np.exp(np.linspace(-1, 0, len(illiquidity)))
+    weights = weights / np.sum(weights)
     
-    # Calculate rolling average
-    illiquidity_ma = pd.Series(illiquidity).rolling(window=window, min_periods=1).mean().fillna(0.0001)
+    # Calculate weighted rolling average
+    illiquidity_ma = pd.Series(illiquidity).rolling(
+        window=window,
+        min_periods=1,
+        win_type='gaussian'
+    ).mean(std=3).fillna(0.0001)
+    
+    # Add market impact adjustment
+    market_impact = 0.1 * np.std(returns) / np.mean(dollar_volume)
+    illiquidity_ma = illiquidity_ma * (1 + market_impact)
     
     # Ensure reasonable values
     illiquidity_ma = np.clip(illiquidity_ma, 0.00001, 0.01)
     
     return illiquidity_ma.values
 
+def calculate_market_impact(price, volume, base_volume, kyle_lambda, amihud):
+    """
+    Calculate market impact with enhanced accuracy
+    
+    Args:
+        price (float): Current price
+        volume (float): Current volume
+        base_volume (float): Base volume (e.g., 20-day average)
+        kyle_lambda (float): Kyle's lambda coefficient
+        amihud (float): Amihud's illiquidity measure
+        
+    Returns:
+        float: Market impact on price
+    """
+    # Calculate volume ratio
+    volume_ratio = volume / base_volume
+    
+    # Calculate temporary impact (Kyle's lambda)
+    temp_impact = kyle_lambda * np.sqrt(volume_ratio)
+    
+    # Calculate permanent impact (Amihud)
+    perm_impact = amihud * volume_ratio
+    
+    # Combine impacts with volume-dependent weights
+    total_impact = (
+        0.7 * temp_impact +  # Temporary impact
+        0.3 * perm_impact    # Permanent impact
+    )
+    
+    # Add non-linear scaling for large trades
+    if volume_ratio > 2:
+        total_impact *= np.sqrt(volume_ratio)
+    
+    return total_impact * price
+
+def calculate_cross_asset_correlation(returns_dict, window=20):
+    """
+    Calculate cross-asset correlations with dynamic adjustment
+    
+    Args:
+        returns_dict (dict): Dictionary of return series
+        window (int): Rolling window size
+        
+    Returns:
+        pd.DataFrame: Correlation matrix
+    """
+    # Convert to DataFrame
+    returns_df = pd.DataFrame(returns_dict)
+    
+    # Calculate rolling correlations
+    rolling_corr = returns_df.rolling(window=window, min_periods=10).corr()
+    
+    # Calculate volatility ratio
+    vol_ratio = returns_df.std() / returns_df.std().mean()
+    
+    # Adjust correlations based on volatility
+    for col in returns_df.columns:
+        rolling_corr.loc[col] *= (1 + 0.1 * (vol_ratio[col] - 1))
+    
+    # Ensure correlations are within [-1, 1]
+    rolling_corr = rolling_corr.clip(-1, 1)
+    
+    return rolling_corr
+
+def calculate_group_beta(returns, market_returns, window=20):
+    """
+    Calculate group beta with dynamic adjustment
+    
+    Args:
+        returns (pd.Series): Group returns
+        market_returns (pd.Series): Market returns
+        window (int): Rolling window size
+        
+    Returns:
+        float: Dynamic beta
+    """
+    # Calculate rolling covariance and variance
+    rolling_cov = returns.rolling(window=window).cov(market_returns)
+    rolling_var = market_returns.rolling(window=window).var()
+    
+    # Calculate beta
+    beta = rolling_cov / rolling_var
+    
+    # Add momentum adjustment
+    momentum = returns.pct_change(window).mean()
+    beta *= (1 + 0.1 * momentum)
+    
+    # Ensure reasonable values
+    beta = beta.clip(0.1, 3.0)
+    
+    return beta.fillna(1.0)
+
 def simulate_market_multiple(traders, market_data, stock_groups, days=100):
     """
-    Simulate market for multiple stocks with cross-asset interactions
+    Simulate market for multiple stocks with cross-asset interactions and improved price tracking
     """
     # Initialize results containers
     simulated_prices = {}
@@ -1281,7 +1389,6 @@ def simulate_market_multiple(traders, market_data, stock_groups, days=100):
                 returns = market_data[stock][f'Close_{stock}'].pct_change().dropna()
                 group_returns[stock] = returns
         
-        # Calculate average group beta and correlation
         if not group_returns.empty:
             market_return = group_returns.mean(axis=1)
             group_betas[group_name] = group_returns.std().mean() / market_return.std()
@@ -1296,33 +1403,14 @@ def simulate_market_multiple(traders, market_data, stock_groups, days=100):
         beta = group_betas.get(group_name, 1.0)
         correlation = group_correlations.get(group_name, 0.3)
         
-        # Generate more strongly correlated random walks for the group
-        correlation_matrix = np.full((len(stocks), len(stocks)), correlation)
-        np.fill_diagonal(correlation_matrix, 1.0)
+        # Generate correlated market movements for the group
+        market_movement = np.random.normal(0, 0.01, days)
         
-        # Add sector-specific correlation boost
-        if group_name == 'Technology':
-            correlation_matrix += 0.2  # Tech stocks tend to be more correlated
-        elif group_name == 'Finance':
-            correlation_matrix += 0.3  # Financial stocks are highly correlated
-        elif group_name == 'Energy':
-            correlation_matrix += 0.25  # Energy stocks are also highly correlated
-        
-        # Ensure correlation matrix stays within valid bounds
-        correlation_matrix = np.clip(correlation_matrix, 0, 1)
-        np.fill_diagonal(correlation_matrix, 1.0)
-        
-        # Ensure correlation matrix is positive definite
-        min_eig = np.min(np.linalg.eigvals(correlation_matrix))
-        if min_eig < 0:
-            correlation_matrix -= min_eig * np.eye(len(stocks))
-        
-        # Generate market-wide movement with reduced volatility
-        market_movement = np.random.normal(0, 0.005, days)  # Reduced from 0.01
-        
+        # Generate correlated random walks for the group
         random_walks = np.random.multivariate_normal(
             mean=[0] * len(stocks),
-            cov=correlation_matrix,
+            cov=np.full((len(stocks), len(stocks)), correlation) + \
+                np.eye(len(stocks)) * (1 - correlation),
             size=days
         )
         
@@ -1338,114 +1426,111 @@ def simulate_market_multiple(traders, market_data, stock_groups, days=100):
                 volatility = returns.std()
                 mean_return = returns.mean()
                 
-                # Calculate actual trend (over the last 100 days)
-                lookback = min(100, len(market_data[stock]))
-                actual_prices = market_data[stock][f'Close_{stock}'].iloc[-lookback:]
-                actual_trend = (actual_prices.iloc[-1] / actual_prices.iloc[0]) ** (1/lookback) - 1
+                # Calculate historical price momentum and trend
+                price_history = market_data[stock][f'Close_{stock}'].values[-20:]
+                momentum = (price_history[-1] - price_history[0]) / price_history[0]
                 
-                # Calculate Amihud's illiquidity measure
-                illiquidity = calculate_amihud_illiquidity(
-                    market_data[stock][f'Close_{stock}'].values,
-                    market_data[stock][f'Volume_{stock}'].values
-                )
-                avg_illiquidity = np.mean(illiquidity)
-                
-                # Calculate volume characteristics
-                mean_volume = market_data[stock][f'Volume_{stock}'].mean()
-                volume_std = market_data[stock][f'Volume_{stock}'].std()
-                volume_skew = market_data[stock][f'Volume_{stock}'].skew()
-                
-                # Calculate volume-price relationship
-                volume_price_corr = np.corrcoef(
-                    market_data[stock][f'Volume_{stock}'].values,
-                    market_data[stock][f'Close_{stock}'].values
-                )[0,1]
+                # Calculate volume trend
+                volume_history = market_data[stock][f'Volume_{stock}'].values[-20:]
+                volume_trend = np.mean(volume_history[-5:]) / np.mean(volume_history)
                 
                 # Initialize price and volume arrays
                 prices = [last_price]
                 volumes = [last_volume]
                 
                 # Initialize stock-specific state
-                momentum = 0
+                momentum_factor = momentum
                 stock_volatility = volatility
-                volume_momentum = 0
+                volume_factor = volume_trend
+                
+                # Calculate Kyle's lambda and Amihud's illiquidity
+                kyle_lambda = calculate_kyle_lambda(
+                    np.diff(price_history) / price_history[:-1],
+                    volume_history[:-1]
+                )
+                amihud = calculate_amihud_illiquidity(price_history, volume_history)
+                
+                # Calculate actual price trend using linear regression
+                x = np.arange(len(price_history))
+                slope, intercept = np.polyfit(x, price_history, 1)
+                trend_factor = slope / price_history[-1]
+                
+                # Calculate directional bias from recent price action
+                recent_direction = np.sign(np.diff(price_history[-5:]))
+                direction_bias = np.mean(recent_direction)
+                
+                # Calculate price momentum using simple moving average
+                price_momentum = np.mean(np.diff(price_history[-5:])) / price_history[-1]
                 
                 for day in range(days):
-                    # Market component (scaled by beta)
-                    market_impact = market_movement[day] * beta * 0.4  # Reduced market impact
+                    # Market component with reduced impact
+                    market_impact = market_movement[day] * beta * (1 + 0.05 * np.sin(day/10))
                     
-                    # Group component (from correlated random walks)
-                    group_impact = random_walks[day, i] * correlation * 0.3  # Scaled group impact
+                    # Group component with reduced impact
+                    group_impact = random_walks[day, i] * correlation * (1 + 0.03 * np.cos(day/20))
                     
-                    # Stock-specific component (with actual trend)
-                    stock_specific = np.random.normal(actual_trend, stock_volatility * 0.5)  # Reduced volatility
+                    # Stock-specific component with GARCH-like volatility
+                    stock_specific = np.random.normal(mean_return, stock_volatility * 0.5)
                     
-                    # Momentum component (with decay)
-                    momentum = 0.7 * momentum + 0.3 * stock_specific  # Slower momentum decay
+                    # Update volatility with GARCH-like effect
+                    stock_volatility = np.sqrt(0.95 * stock_volatility**2 + 0.05 * stock_specific**2)
+                    
+                    # Enhanced momentum component with bounds
+                    momentum_factor = np.clip(
+                        0.95 * momentum_factor + 0.05 * (price_momentum + direction_bias),
+                        -volatility * 2,
+                        volatility * 2
+                    )
+                    
+                    # Volume impact on price (reduced)
+                    volume_impact = kyle_lambda * (volumes[-1] - last_volume) / last_volume * 0.5
+                    
+                    # Illiquidity impact (reduced)
+                    illiquidity_impact = amihud[-1] * np.random.normal(0, 0.5)
+                    
+                    # Enhanced trend following component with bounds
+                    trend_impact = np.clip(
+                        trend_factor * (1 + 0.1 * np.sin(day/15)),
+                        -volatility * 2,
+                        volatility * 2
+                    )
                     
                     # Combine all effects with adjusted weights
                     total_return = (
-                        0.25 * market_impact +     # Market effect
-                        0.25 * group_impact +      # Group effect
-                        0.25 * stock_specific +    # Stock-specific effect
-                        0.25 * momentum +          # Momentum effect
-                        actual_trend * 0.2         # Add scaled actual trend
+                        0.10 * market_impact +     # Market effect (reduced)
+                        0.10 * group_impact +      # Group effect (reduced)
+                        0.15 * stock_specific +    # Stock-specific effect
+                        0.25 * momentum_factor +   # Momentum effect (increased)
+                        0.10 * volume_impact +     # Volume impact
+                        0.05 * illiquidity_impact + # Illiquidity effect
+                        0.25 * trend_impact        # Trend following (increased)
                     )
+                    
+                    # Add directional bias with bounds
+                    total_return += 0.1 * np.clip(direction_bias, -volatility, volatility)
+                    
+                    # Stronger mean reversion for extreme moves
+                    if abs(total_return) > 1.5 * volatility:
+                        total_return *= 0.6
                     
                     # Update price with total return
                     new_price = prices[-1] * (1 + total_return)
                     
-                    # Ensure price stays within reasonable bounds
-                    max_daily_move = min(0.05, volatility * 3)  # Cap daily moves
-                    price_change_pct = (new_price - prices[-1]) / prices[-1]
-                    if abs(price_change_pct) > max_daily_move:
-                        new_price = prices[-1] * (1 + np.sign(price_change_pct) * max_daily_move)
+                    # Tighter bounds on price movements
+                    max_move = min(0.05, 0.03 + abs(momentum_factor))
+                    new_price = max(prices[-1] * 0.95, min(new_price, prices[-1] * (1 + max_move)))
                     
-                    # Calculate volume based on price movement and illiquidity
-                    price_impact = abs(price_change_pct) / avg_illiquidity
-                    
-                    # Base volume from log-normal distribution
-                    volume_base = np.random.lognormal(
-                        mean=np.log(mean_volume),
-                        sigma=np.log(1 + volume_std/mean_volume),
-                        size=1
-                    )[0]
-                    
-                    # Volume momentum (autocorrelation)
-                    volume_momentum = 0.8 * volume_momentum + 0.2 * np.random.normal(0, 0.1)
-                    
-                    # Combine volume factors
-                    volume_change = np.exp(
-                        0.3 * random_walks[day, i] +  # Group effect
-                        0.3 * price_impact +  # Price impact (scaled by illiquidity)
-                        0.2 * volume_momentum +  # Volume momentum
-                        0.1 * volume_skew +  # Volume skewness
-                        0.1 * volume_price_corr  # Price-volume correlation
-                    )
-                    
-                    new_volume = volume_base * volume_change
-                    
-                    # Add intraday pattern effect (U-shape)
-                    hour = (day % 6.5) / 6.5  # Simulate trading hours
-                    u_shape = 1 + 0.2 * (1 - 4 * (hour - 0.5)**2)  # U-shaped curve
-                    new_volume *= u_shape
-                    
-                    # Add volume spikes for large price moves
-                    if abs(price_change_pct) > volatility * 2:
-                        new_volume *= (1 + abs(price_change_pct) * 2)
-                    
-                    # Ensure volume stays within reasonable bounds
-                    max_volume_change = 2.0
-                    volume_ratio = new_volume / volumes[-1]
-                    if volume_ratio > max_volume_change:
-                        new_volume = volumes[-1] * max_volume_change
-                    elif volume_ratio < 1/max_volume_change:
-                        new_volume = volumes[-1] / max_volume_change
+                    # Update volume with more stable scaling
+                    volume_change = np.exp(random_walks[day, i] * 0.3) * (1 + abs(total_return) * 0.5)
+                    volume_change *= (1 + 0.05 * np.sin(day/5))  # Reduced cyclical component
+                    new_volume = last_volume * volume_change * volume_factor
                     
                     # Update state
                     prices.append(new_price)
                     volumes.append(new_volume)
-                    stock_volatility = 0.95 * stock_volatility + 0.05 * abs(total_return)  # Slower volatility updating
+                    
+                    # Slower volume factor drift
+                    volume_factor = 0.98 * volume_factor + 0.02 * (new_volume / last_volume)
                 
                 group_prices[stock] = prices
                 group_volumes[stock] = volumes
@@ -1479,11 +1564,19 @@ def plot_group_results(actual_data, simulated_prices, simulated_volumes, group_n
         actual_prices = actual_data[stock][f'Close_{stock}'].values[-len(dates):]
         sim_prices = simulated_prices[group_name][stock][1:]  # Skip initial seed
         
-        ax1.plot(dates, actual_prices, label=f'Actual {stock}', color='blue')
-        ax1.plot(dates, sim_prices, label=f'Simulated {stock}', color='red', linestyle='--')
+        # Calculate price ranges for y-axis limits
+        price_min = min(min(actual_prices), min(sim_prices))
+        price_max = max(max(actual_prices), max(sim_prices))
+        price_range = price_max - price_min
+        y_min = price_min - 0.1 * price_range
+        y_max = price_max + 0.1 * price_range
+        
+        ax1.plot(dates, actual_prices, label=f'Actual {stock}', color='blue', linewidth=2)
+        ax1.plot(dates, sim_prices, label=f'Simulated {stock}', color='red', linestyle='--', linewidth=2)
         ax1.set_title(f'{stock} Price')
         ax1.set_xlabel('Date')
         ax1.set_ylabel('Price ($)')
+        ax1.set_ylim(y_min, y_max)
         ax1.legend()
         ax1.grid(True)
         
@@ -1492,17 +1585,24 @@ def plot_group_results(actual_data, simulated_prices, simulated_volumes, group_n
         actual_volumes = actual_data[stock][f'Volume_{stock}'].values[-len(dates):]
         sim_volumes = simulated_volumes[group_name][stock][1:]  # Skip initial seed
         
-        ax2.plot(dates, actual_volumes, label=f'Actual {stock}', color='blue')
-        ax2.plot(dates, sim_volumes, label=f'Simulated {stock}', color='red', linestyle='--')
+        # Calculate volume ranges for y-axis limits
+        volume_min = min(min(actual_volumes), min(sim_volumes))
+        volume_max = max(max(actual_volumes), max(sim_volumes))
+        volume_range = volume_max - volume_min
+        y_min = volume_min - 0.1 * volume_range
+        y_max = volume_max + 0.1 * volume_range
+        
+        ax2.plot(dates, actual_volumes, label=f'Actual {stock}', color='blue', linewidth=2)
+        ax2.plot(dates, sim_volumes, label=f'Simulated {stock}', color='red', linestyle='--', linewidth=2)
         ax2.set_title(f'{stock} Volume')
         ax2.set_xlabel('Date')
         ax2.set_ylabel('Volume')
-        ax2.set_yscale('log')
+        ax2.set_ylim(y_min, y_max)
         ax2.legend()
         ax2.grid(True)
     
-        plt.tight_layout()
-    plt.savefig(f'{group_name}_simulation_results.png')
+    plt.tight_layout()
+    plt.savefig(get_visualization_path('sectors', f'{group_name}_simulation_results.png'))
     plt.close()
 
 def analyze_group_performance(actual_data, simulated_prices, simulated_volumes, group_name):
@@ -1521,6 +1621,10 @@ def analyze_group_performance(actual_data, simulated_prices, simulated_volumes, 
     metrics = {}
     stocks = simulated_prices[group_name].keys()
     
+    # Calculate group-level metrics
+    group_actual_returns = pd.DataFrame()
+    group_sim_returns = pd.DataFrame()
+    
     for stock in stocks:
         # Get actual and simulated data
         actual_prices = actual_data[stock][f'Close_{stock}'].values[-len(simulated_prices[group_name][stock])+1:]
@@ -1532,10 +1636,18 @@ def analyze_group_performance(actual_data, simulated_prices, simulated_volumes, 
         actual_returns = np.diff(actual_prices) / actual_prices[:-1]
         simulated_returns = np.diff(sim_prices) / sim_prices[:-1]
         
-        # Calculate metrics
+        # Store returns for group analysis
+        group_actual_returns[stock] = actual_returns
+        group_sim_returns[stock] = simulated_returns
+        
+        # Calculate individual stock metrics
+        price_corr = np.corrcoef(actual_prices, sim_prices)[0,1]
+        volume_corr = np.corrcoef(actual_volumes, sim_volumes)[0,1]
+        
         metrics[stock] = {
-            'price_correlation': np.corrcoef(actual_prices, sim_prices)[0,1],
-            'volume_correlation': np.corrcoef(actual_volumes, sim_volumes)[0,1],
+            'price_correlation': price_corr,
+            'r_squared': price_corr ** 2,  # Add R-squared
+            'volume_correlation': volume_corr,
             'actual_volatility': np.std(actual_returns),
             'simulated_volatility': np.std(simulated_returns),
             'actual_mean_return': np.mean(actual_returns),
@@ -1543,6 +1655,20 @@ def analyze_group_performance(actual_data, simulated_prices, simulated_volumes, 
             'tracking_error': np.std(actual_returns - simulated_returns),
             'volume_ratio': np.mean(sim_volumes) / np.mean(actual_volumes)
         }
+    
+    # Calculate group-level R-squared
+    group_actual_mean = group_actual_returns.mean(axis=1)
+    group_sim_mean = group_sim_returns.mean(axis=1)
+    group_corr = np.corrcoef(group_actual_mean, group_sim_mean)[0,1]
+    group_r_squared = group_corr ** 2
+    
+    # Add group-level metrics
+    metrics['group'] = {
+        'r_squared': group_r_squared,
+        'correlation': group_corr,
+        'mean_r_squared': np.mean([m['r_squared'] for m in metrics.values()]),
+        'median_r_squared': np.median([m['r_squared'] for m in metrics.values()])
+    }
     
     return metrics
 
@@ -1704,26 +1830,83 @@ def main():
     for sector in sector_groups:
         print(f"\n{sector} Sector Analysis:")
         metrics = analyze_group_performance(stock_data, sector_prices, sector_volumes, sector)
-        plot_group_results(stock_data, sector_prices, sector_volumes, sector, dates)
         
-        print(f"\nCorrelation within {sector}: {sector_correlations[sector]:.3f}")
+        # Print group-level R-squared
+        group_metrics = metrics['group']
+        print(f"\nGroup-level R-squared: {group_metrics['r_squared']:.1%}")
+        print(f"Mean R-squared across stocks: {group_metrics['mean_r_squared']:.1%}")
+        print(f"Median R-squared across stocks: {group_metrics['median_r_squared']:.1%}")
+        
+        # Print individual stock metrics
         for stock, stock_metrics in metrics.items():
-            print(f"\n{stock} Metrics:")
-            for metric, value in stock_metrics.items():
-                print(f"{metric}: {value:.3f}")
+            if stock != 'group':  # Skip group metrics
+                print(f"\n{stock} Metrics:")
+                print(f"R-squared: {stock_metrics['r_squared']:.1%}")
+                print(f"Price correlation: {stock_metrics['price_correlation']:.3f}")
+                print(f"Volume correlation: {stock_metrics['volume_correlation']:.3f}")
+                print(f"Tracking error: {stock_metrics['tracking_error']:.3f}")
+                print(f"Volume ratio: {stock_metrics['volume_ratio']:.3f}")
+        
+        plot_group_results(stock_data, sector_prices, sector_volumes, sector, dates)
     
     # Plot and analyze results for volatility groups
     print("\nAnalyzing volatility group performance...")
     for group in volatility_groups:
         print(f"\n{group} Analysis:")
         metrics = analyze_group_performance(stock_data, vol_prices, vol_volumes, group)
-        plot_group_results(stock_data, vol_prices, vol_volumes, group, dates)
         
-        print(f"\nCorrelation within {group}: {vol_correlations[group]:.3f}")
+        # Print group-level R-squared
+        group_metrics = metrics['group']
+        print(f"\nGroup-level R-squared: {group_metrics['r_squared']:.1%}")
+        print(f"Mean R-squared across stocks: {group_metrics['mean_r_squared']:.1%}")
+        print(f"Median R-squared across stocks: {group_metrics['median_r_squared']:.1%}")
+        
+        # Print individual stock metrics
         for stock, stock_metrics in metrics.items():
-            print(f"\n{stock} Metrics:")
-            for metric, value in stock_metrics.items():
-                print(f"{metric}: {value:.3f}")
+            if stock != 'group':  # Skip group metrics
+                print(f"\n{stock} Metrics:")
+                print(f"R-squared: {stock_metrics['r_squared']:.1%}")
+                print(f"Price correlation: {stock_metrics['price_correlation']:.3f}")
+                print(f"Volume correlation: {stock_metrics['volume_correlation']:.3f}")
+                print(f"Tracking error: {stock_metrics['tracking_error']:.3f}")
+                print(f"Volume ratio: {stock_metrics['volume_ratio']:.3f}")
+        
+        plot_group_results(stock_data, vol_prices, vol_volumes, group, dates)
+
+def get_visualization_path(category, filename):
+    """
+    Get the correct path for saving visualizations based on category.
+    
+    Args:
+        category (str): One of 'market', 'trading', or 'sectors'
+        filename (str): Name of the visualization file
+    
+    Returns:
+        str: Full path where the visualization should be saved
+    """
+    # Create base visualization directory if it doesn't exist
+    base_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'visualizations')
+    os.makedirs(base_dir, exist_ok=True)
+    
+    # Create category-specific directory
+    category_dir = os.path.join(base_dir, category)
+    os.makedirs(category_dir, exist_ok=True)
+    
+    return os.path.join(category_dir, filename)
+
+def plot_market_dynamics(market_data, simulated_prices):
+    # ... existing plotting code ...
+    
+    # Save the plot
+    plt.savefig(get_visualization_path('market', 'market_simulation.png'))
+    plt.close()
+
+def plot_trading_results(trading_results):
+    # ... existing plotting code ...
+    
+    # Save the plot
+    plt.savefig(get_visualization_path('trading', 'trading_results.png'))
+    plt.close()
 
 if __name__ == "__main__":
     main()
